@@ -1,0 +1,33 @@
+# Podman Quadlet unit.
+# Install to:  ~/.config/containers/systemd/bm-friend-monitor.container  (rootless)
+#         or:  /etc/containers/systemd/bm-friend-monitor.container        (system)
+# Then:  systemctl --user daemon-reload && systemctl --user start bm-friend-monitor
+#
+# Adjust Image= to match the tag you built, and EnvironmentFile= to your .env path.
+
+[Unit]
+Description=BrandMeister monitor (Pushover notifier)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/bm-friend-monitor:latest
+EnvironmentFile=%h/bm-friend-monitor/.env
+# No published ports needed: the app only makes outbound connections.
+
+# Healthcheck defined here so it works regardless of image format (OCI/Docker).
+# If the connection wedges, the health file goes stale and the container is
+# killed, then restarted by the [Service] Restart= policy below.
+HealthCmd=python /app/healthcheck.py
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=40s
+HealthRetries=3
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
