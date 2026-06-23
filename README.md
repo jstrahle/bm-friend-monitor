@@ -9,6 +9,8 @@ No BrandMeister account or API key is needed — the Last Heard feed is a public
 read-only Socket.IO stream. After connecting, the client must `join` a
 subscription (the app does this automatically).
 
+It runs equally well under **Podman** or **Docker**; both are covered below.
+
 > **What "spotted" means:** DMR has no persistent "online" presence for end
 > users. You only know a station is around when it actually keys up and
 > transmits. This app notifies you when a watched target is *heard*.
@@ -22,8 +24,9 @@ subscription (the app does this automatically).
 | `healthcheck.py` | Container healthcheck (freshness of the health file) |
 | `requirements.txt` | Python dependencies |
 | `Containerfile` | Image build recipe (Podman/Docker), with HEALTHCHECK |
+| `compose.yaml` | Docker / Podman Compose deployment |
 | `.env.example` | Copy to `.env` and fill in your settings |
-| `bm-friend-monitor.container` | Optional systemd Quadlet unit |
+| `bm-friend-monitor.container` | Optional systemd Quadlet unit (Podman) |
 
 ## Quick start
 
@@ -31,10 +34,12 @@ subscription (the app does this automatically).
    **API token** from https://pushover.net/apps/build. Install the Pushover app.
 2. Find DMR IDs / talkgroup / repeater numbers (radioid.net, or the
    BrandMeister Last Heard page).
-3. Configure and run:
+3. `cp .env.example .env` and edit it (Pushover keys + what to watch).
+4. Build and run with Podman, Docker, or Compose.
+
+### With Podman
 
 ```bash
-cp .env.example .env          # edit: Pushover keys + what to watch
 podman build --format docker -t bm-friend-monitor:latest .
 podman run -d --name bm-friend-monitor \
   --env-file .env \
@@ -44,12 +49,38 @@ podman run -d --name bm-friend-monitor \
 podman logs -f bm-friend-monitor
 ```
 
-> **`--format docker` matters.** Podman defaults to OCI image format, which
-> silently ignores the image's `HEALTHCHECK` (you'll see a warning) and then
-> `--health-on-failure=kill` errors with "cannot set on-failure action to kill
-> without a health check." Building with `--format docker` preserves it. If you
-> prefer to keep OCI format, define the check at run time instead (see
-> "Healthcheck & auto-recovery" below).
+> **`--format docker` matters for Podman.** Podman defaults to OCI image format,
+> which silently ignores the image's `HEALTHCHECK` (you'll see a warning) and
+> then `--health-on-failure=kill` errors with "cannot set on-failure action to
+> kill without a health check." Building with `--format docker` preserves it. If
+> you keep OCI format, define the check at run time instead (see "Healthcheck &
+> auto-recovery").
+
+### With Docker
+
+Docker builds in Docker format by default, so the `HEALTHCHECK` is honored with
+no extra flag — but `docker build` looks for `Dockerfile`, so point it at the
+`Containerfile` with `-f`. Docker also has no `--health-on-failure`; see
+"Healthcheck & auto-recovery" for restart-on-unhealthy.
+
+```bash
+docker build -f Containerfile -t bm-friend-monitor:latest .
+docker run -d --name bm-friend-monitor \
+  --env-file .env \
+  --restart=unless-stopped \
+  bm-friend-monitor:latest
+docker logs -f bm-friend-monitor
+```
+
+### With Compose (Docker or Podman)
+
+`compose.yaml` builds the image and starts the container, reading `.env`:
+
+```bash
+docker compose up -d --build      # or: podman compose up -d --build
+docker compose logs -f
+docker compose down               # stop and remove
+```
 
 On startup the log shows what you're watching and the subscription tokens
 (`src_…` for IDs, `dst_…` for talkgroups, `con_…` for repeaters). Key up and
@@ -108,19 +139,28 @@ alert rather than one per operator. To instead get a notification for every
 operator on a watched talkgroup, set `DEDUP_TALKGROUP=station_tg` (and likewise
 `DEDUP_REPEATER=station_repeater`).
 
+### Duplicate / replayed events
+
+BrandMeister periodically re-emits old Last Heard entries (and replays a recent
+buffer on reconnect). Left unchecked, a transmission could notify you again once
+its `MIN_SILENCE` window expired. `MAX_EVENT_AGE` (default 180s) drops any event
+whose transmission ended more than that long ago — a live `Session-Stop` arrives
+within seconds, so only stale replays are filtered. Near-simultaneous duplicates
+are handled separately by the `MIN_SILENCE` debounce.
+
 ## Healthcheck & auto-recovery
 
 The app refreshes `HEALTH_FILE` every ~10s while the socket is connected.
 `healthcheck.py` exits non-zero if that file is older than `HEALTH_MAX_AGE`
 seconds (default 90) — catching a connection that wedges half-alive without
-crashing the process. With `--health-on-failure=kill` plus
-`--restart=unless-stopped`, Podman kills and restarts it automatically. Check
-status with `podman healthcheck run bm-friend-monitor` or the `STATUS` column
-of `podman ps`.
+crashing the process. Check status with the `STATUS` column of `podman ps` /
+`docker ps`, or `podman healthcheck run bm-friend-monitor`.
 
-The image carries a `HEALTHCHECK`, **but Podman only honors it when the image
-is built in Docker format** (`podman build --format docker ...`); OCI format
-ignores it. If you build OCI instead, define the check at run time:
+**Podman** can act on the result directly: `--health-on-failure=kill` plus
+`--restart=unless-stopped` kills and restarts an unhealthy container
+automatically. The image carries a `HEALTHCHECK`, but Podman only honors a
+baked-in one when the image is built in Docker format
+(`podman build --format docker ...`); with OCI format, define it at run time:
 
 ```bash
 podman run -d --name bm-friend-monitor \
@@ -134,6 +174,27 @@ podman run -d --name bm-friend-monitor \
 
 The Quadlet unit defines the healthcheck itself, so the systemd path works
 regardless of image format.
+
+**Docker** honors the baked-in `HEALTHCHECK` automatically, but has no
+`--health-on-failure`: `--restart` only reacts to a container *exiting*, not to
+it going unhealthy while still running. To restart-on-unhealthy, run the small
+`autoheal` sidecar alongside it:
+
+```bash
+docker run -d --name bm-friend-monitor \
+  --env-file .env --restart=unless-stopped \
+  --label autoheal=true \
+  bm-friend-monitor:latest
+
+docker run -d --name autoheal --restart=unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  willfarrell/autoheal
+```
+
+`autoheal` watches for containers labelled `autoheal=true` that report unhealthy
+and restarts them. (It needs the Docker socket; review that access for your
+environment.) Docker Swarm is an alternative — it reschedules unhealthy tasks
+natively.
 
 ## Run as a systemd service (Quadlet)
 
@@ -158,6 +219,7 @@ loginctl enable-linger "$USER"   # keep it running after you log out
 | `WATCH_REPEATERS` | — | Repeater IDs, optional `=Label` |
 | `MIN_SILENCE` | `300` | Seconds before re-notifying the same dedup bucket |
 | `MIN_DURATION` | `0` | Ignore transmissions shorter than this (s) |
+| `MAX_EVENT_AGE` | `180` | Drop replayed/stale events older than this (s); 0 disables |
 | `NOTIFY_ON` | `Session-Stop` | Event to act on |
 | `DEDUP_PERSON` | `station_tg` | Dedup scope for DMR ID / callsign matches |
 | `DEDUP_TALKGROUP` | `talkgroup` | Dedup scope for talkgroup matches |

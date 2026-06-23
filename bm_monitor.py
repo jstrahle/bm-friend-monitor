@@ -53,6 +53,12 @@ MIN_SILENCE = int(os.environ.get("MIN_SILENCE", "300"))
 # Ignore very short keyups (kerchunks). 0 = report everything.
 MIN_DURATION = int(os.environ.get("MIN_DURATION", "0"))
 
+# Drop stale/replayed events whose transmission ended more than this many
+# seconds ago (by the event's Stop time). BrandMeister periodically re-emits
+# old Last Heard entries, and replays a recent buffer on reconnect; without
+# this they would re-notify once MIN_SILENCE elapsed. 0 disables the check.
+MAX_EVENT_AGE = int(os.environ.get("MAX_EVENT_AGE", "180"))
+
 # Quiet hours: during this LOCAL-time window, either suppress notifications
 # ("mute") or downgrade them to low Pushover priority ("low"). Empty = always
 # notify normally.
@@ -448,6 +454,20 @@ def on_mqtt(data):
     if NOTIFY_ON and event != NOTIFY_ON:
         return
 
+    # Drop stale/replayed events. A live Session-Stop arrives within seconds of
+    # the transmission ending; a replayed Last Heard entry is minutes old.
+    stop_ts = call.get("Stop") or 0
+    if MAX_EVENT_AGE and stop_ts:
+        try:
+            age = int(time.time()) - int(stop_ts)
+        except (ValueError, TypeError):
+            age = 0
+        if age > MAX_EVENT_AGE:
+            log.debug("Ignoring stale event (age %ds > %ds): %s on TG %s",
+                      age, MAX_EVENT_AGE, call.get("SourceCall"),
+                      call.get("DestinationID"))
+            return
+
     # Normalize SourceID to an int: the feed may deliver it as a number or as
     # a numeric string, and WATCH_IDS holds ints.
     src_id_raw = call.get("SourceID")
@@ -549,9 +569,9 @@ def handle_signal(signum, _frame):
 def main():
     validate_config()
     log.info("Watching %d ID(s), %d callsign(s), %d talkgroup(s), %d repeater(s). "
-             "min_silence=%ds, min_duration=%ds, notify_on=%s",
+             "min_silence=%ds, min_duration=%ds, max_event_age=%ds, notify_on=%s",
              len(WATCH_IDS), len(WATCH_CALLS), len(WATCH_TGS), len(WATCH_RPTS),
-             MIN_SILENCE, MIN_DURATION, NOTIFY_ON)
+             MIN_SILENCE, MIN_DURATION, MAX_EVENT_AGE, NOTIFY_ON)
     if WATCH_IDS:
         log.info("DMR IDs: %s", ", ".join(str(i) for i in sorted(WATCH_IDS)))
     if WATCH_CALLS:

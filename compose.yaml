@@ -1,0 +1,28 @@
+# Compose deployment — works with `docker compose` or `podman compose`.
+# Settings are read from .env in this directory.
+#
+#   docker compose up -d --build     # build the image and start
+#   docker compose logs -f           # follow logs
+#   docker compose down              # stop and remove
+#
+# (Substitute `podman compose` for `docker compose` if you prefer Podman.)
+
+services:
+  bm-monitor:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: bm-friend-monitor:latest
+    container_name: bm-friend-monitor
+    env_file: .env
+    restart: unless-stopped
+    # Mirrors the image's HEALTHCHECK so it applies regardless of build format.
+    # Note: plain Compose does not auto-restart an *unhealthy* (but running)
+    # container — it only restarts on exit. See the README for auto-recovery
+    # options (the `autoheal` sidecar, or Swarm mode).
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
