@@ -23,10 +23,37 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import socketio
+
+# --------------------------------------------------------------------------- #
+# Logging (configured first, so config parsing below can warn cleanly)
+# --------------------------------------------------------------------------- #
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("bm_monitor")
+
+
+def _env_int(name, default):
+    """Read an integer env var, falling back (with a warning) on bad input
+    instead of crashing the process at import time."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        log.warning("Invalid %s=%r; using default %d.", name, raw, default)
+        return default
+
 
 # --------------------------------------------------------------------------- #
 # Configuration (from environment)
@@ -37,7 +64,7 @@ BM_SOCKETIO_PATH = os.environ.get("BM_SOCKETIO_PATH", "/lh/socket.io")
 
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "").strip()
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "").strip()
-PUSHOVER_PRIORITY = int(os.environ.get("PUSHOVER_PRIORITY", "0"))
+PUSHOVER_PRIORITY = _env_int("PUSHOVER_PRIORITY", 0)
 PUSHOVER_DEVICE = os.environ.get("PUSHOVER_DEVICE", "").strip()  # optional
 PUSHOVER_SOUND = os.environ.get("PUSHOVER_SOUND", "").strip()    # optional
 
@@ -48,16 +75,16 @@ NOTIFY_ON = os.environ.get("NOTIFY_ON", "Session-Stop").strip()
 
 # Anti-flood: after notifying for a given station, stay quiet for this many
 # seconds before notifying about that same station again.
-MIN_SILENCE = int(os.environ.get("MIN_SILENCE", "300"))
+MIN_SILENCE = _env_int("MIN_SILENCE", 300)
 
 # Ignore very short keyups (kerchunks). 0 = report everything.
-MIN_DURATION = int(os.environ.get("MIN_DURATION", "0"))
+MIN_DURATION = _env_int("MIN_DURATION", 0)
 
 # Drop stale/replayed events whose transmission ended more than this many
 # seconds ago (by the event's Stop time). BrandMeister periodically re-emits
 # old Last Heard entries, and replays a recent buffer on reconnect; without
 # this they would re-notify once MIN_SILENCE elapsed. 0 disables the check.
-MAX_EVENT_AGE = int(os.environ.get("MAX_EVENT_AGE", "180"))
+MAX_EVENT_AGE = _env_int("MAX_EVENT_AGE", 180)
 
 # Quiet hours: during this LOCAL-time window, either suppress notifications
 # ("mute") or downgrade them to low Pushover priority ("low"). Empty = always
@@ -65,26 +92,16 @@ MAX_EVENT_AGE = int(os.environ.get("MAX_EVENT_AGE", "180"))
 QUIET_HOURS = os.environ.get("QUIET_HOURS", "").strip()           # e.g. "23:00-07:00"
 QUIET_TZ = os.environ.get("QUIET_TZ", "UTC").strip() or "UTC"     # e.g. "Europe/Helsinki"
 QUIET_MODE = os.environ.get("QUIET_HOURS_MODE", "low").strip().lower()  # "low" | "mute"
-QUIET_PRIORITY = int(os.environ.get("QUIET_PRIORITY", "-1"))      # Pushover priority in "low" mode
+if QUIET_MODE not in ("low", "mute"):
+    log.warning("Unknown QUIET_HOURS_MODE=%r; using 'low'.", QUIET_MODE)
+    QUIET_MODE = "low"
+QUIET_PRIORITY = _env_int("QUIET_PRIORITY", -1)                   # Pushover priority in "low" mode
 
 # Health file: touched on connect and periodically while connected, so an
 # external HEALTHCHECK can detect a wedged/stale connection and restart us.
 HEALTH_FILE = os.environ.get("HEALTH_FILE", "/tmp/bm_health").strip()
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
 USER_AGENT = "bm-friend-monitor/1.0 (+https://github.com/)"
-
-# --------------------------------------------------------------------------- #
-# Logging
-# --------------------------------------------------------------------------- #
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("bm_monitor")
 
 
 # --------------------------------------------------------------------------- #
@@ -140,11 +157,13 @@ WATCH_RPTS, RPT_LABELS = _parse_int_watchlist(
     os.environ.get("WATCH_REPEATERS", ""), "WATCH_REPEATERS")
 
 _call_values, _call_labels = _parse_watchlist(
-    os.environ.get("WATCH_CALLSIGNS", "").upper())
+    os.environ.get("WATCH_CALLSIGNS", ""))
 WATCH_CALLS = {c.upper() for c in _call_values}
 CALL_LABELS = {k.upper(): v for k, v in _call_labels.items()}
 
-# Per-bucket timestamp of the last notification we sent (for MIN_SILENCE).
+# last_notify is read/mutated only inside on_mqtt. python-socketio dispatches
+# event handlers serially from a single task, so no lock is needed today; this
+# assumption breaks if a second handler touches it or the async mode is used.
 last_notify = {}
 
 
@@ -226,16 +245,20 @@ def _parse_quiet_hours(spec):
 
 _quiet_range = _parse_quiet_hours(QUIET_HOURS)
 
+# Resolve the timezone once at startup (cheaper than per-call, and surfaces a
+# bad tz name immediately instead of silently on every check).
+try:
+    _quiet_zone = ZoneInfo(QUIET_TZ)
+except ZoneInfoNotFoundError:
+    log.warning("Unknown QUIET_TZ=%r; falling back to UTC.", QUIET_TZ)
+    _quiet_zone = timezone.utc
+
 
 def in_quiet_hours():
     """True if the current time in QUIET_TZ falls within the quiet window."""
     if not _quiet_range:
         return False
-    try:
-        tz = ZoneInfo(QUIET_TZ)
-    except Exception:  # noqa: BLE001 - bad tz name -> fall back to UTC
-        tz = timezone.utc
-    nowt = datetime.now(tz)
+    nowt = datetime.now(_quiet_zone)
     cur = nowt.hour * 60 + nowt.minute
     start, end = _quiet_range
     if start == end:
@@ -354,12 +377,15 @@ def health_heartbeat():
 # Message construction
 # --------------------------------------------------------------------------- #
 
-def construct_message(call):
+def construct_message(call, match_kind=None):
     src_call = call.get("SourceCall") or "?"
     src_name = call.get("SourceName") or ""
-    src_id = call.get("SourceID") or "?"
-    dst_id = call.get("DestinationID") or "?"
+    src_id = call.get("SourceID")
+    src_id = src_id if src_id is not None else "?"
+    dst_id = call.get("DestinationID")
+    dst_id = dst_id if dst_id is not None else "?"
     dst_name = call.get("DestinationName") or ""
+    ctx_id = call.get("ContextID")
     start = call.get("Start") or 0
     stop = call.get("Stop") or 0
     duration = (stop - start) if (stop and start) else 0
@@ -375,7 +401,11 @@ def construct_message(call):
     if dst_name:
         tg += f" {dst_name}"
 
-    msg = f"{who} [{src_id}] heard on TG {tg} at {when}"
+    msg = f"{who} [{src_id}] heard on TG {tg}"
+    # For repeater matches, note which repeater it came through.
+    if match_kind == "repeater" and ctx_id is not None:
+        msg += f" via repeater {ctx_id}"
+    msg += f" at {when}"
     if duration > 0:
         msg += f" for {duration}s"
     return msg
@@ -534,7 +564,7 @@ def on_mqtt(data):
     priority = QUIET_PRIORITY if quiet else None
 
     title = label or src_call or f"DMR {src_id}"
-    body = construct_message(call)
+    body = construct_message(call, match_kind)
     log.info("MATCH %s%s: %s", dedup_key, " [quiet/low]" if quiet else "", body)
     enqueue_notification(f"{title} on air", body, priority)
 

@@ -10,7 +10,10 @@ import sys
 import time
 
 path = os.environ.get("HEALTH_FILE", "/tmp/bm_health")
-max_age = int(os.environ.get("HEALTH_MAX_AGE", "90"))
+try:
+    max_age = int(os.environ.get("HEALTH_MAX_AGE", "90"))
+except ValueError:
+    max_age = 90
 
 try:
     fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < max_age
